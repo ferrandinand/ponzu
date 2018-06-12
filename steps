@@ -1,0 +1,1 @@
+ sudo docker run -v $(pwd):/go/src/github.com/ponzu-cms/ponzu -p 8080:8080 -it ponzu-dev

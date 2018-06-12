@@ -1,0 +1,6 @@
+FROM ponzu/ponzu:latest
+
+EXPOSE 8080
+
+COPY entrypoint.sh entrypoint.sh
+CMD [ "bash" , "entrypoint.sh" ]

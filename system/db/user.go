@@ -1,7 +1,6 @@
 package db
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,9 +8,10 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/ponzu-cms/ponzu/system/db/repo"
+
 	"github.com/ponzu-cms/ponzu/system/admin/user"
 
-	"github.com/boltdb/bolt"
 	"github.com/nilslice/jwt"
 )
 
@@ -23,39 +23,33 @@ var ErrNoUserExists = errors.New("Error. No user exists.")
 
 // SetUser sets key:value pairs in the db for user settings
 func SetUser(usr *user.User) (int, error) {
-	err := store.Update(func(tx *bolt.Tx) error {
-		email := []byte(usr.Email)
-		users := tx.Bucket([]byte("__users"))
-		if users == nil {
-			return bolt.ErrBucketNotFound
-		}
+	email := []byte(usr.Email)
 
-		// check if user is found by email, fail if nil
-		exists := users.Get(email)
-		if exists != nil {
-			return ErrUserExists
-		}
+	// check if user is found by email, fail if nil
+	val, err := repo.Get("__users", string(email))
+	if err != nil {
+		return 0, err
+	}
 
-		// get NextSequence int64 and set it as the User.ID
-		id, err := users.NextSequence()
-		if err != nil {
-			return err
-		}
-		usr.ID = int(id)
+	if val != "" {
+		return 0, ErrUserExists
+	}
 
-		// marshal User to json and put into bucket
-		j, err := json.Marshal(usr)
-		if err != nil {
-			return err
-		}
+	// get NextSequence int64 and set it as the User.ID
+	id, err := repo.NextSequence("__users")
 
-		err = users.Put(email, j)
-		if err != nil {
-			return err
-		}
+	if err != nil {
+		return 0, err
+	}
+	usr.ID = int(id)
 
-		return nil
-	})
+	// marshal User to json and put into bucket
+	j, err := json.Marshal(usr)
+	if err != nil {
+		return 0, err
+	}
+
+	err = repo.Update("__users", string(email), string(j))
 	if err != nil {
 		return 0, err
 	}
@@ -70,63 +64,33 @@ func UpdateUser(usr, updatedUsr *user.User) error {
 		updatedUsr.ID = usr.ID
 	}
 
-	err := store.Update(func(tx *bolt.Tx) error {
-		users := tx.Bucket([]byte("__users"))
-		if users == nil {
-			return bolt.ErrBucketNotFound
-		}
-
-		// check if user is found by email, fail if nil
-		exists := users.Get([]byte(usr.Email))
-		if exists == nil {
-			return ErrNoUserExists
-		}
-
-		// marshal User to json and put into bucket
-		j, err := json.Marshal(updatedUsr)
-		if err != nil {
-			return err
-		}
-
-		err = users.Put([]byte(updatedUsr.Email), j)
-		if err != nil {
-			return err
-		}
-
-		// if email address was changed, delete the old record of former
-		// user with original email address
-		if usr.Email != updatedUsr.Email {
-			err = users.Delete([]byte(usr.Email))
-			if err != nil {
-				return err
-			}
-
-		}
-
-		return nil
-	})
+	// marshal User to json and put into bucket
+	j, err := json.Marshal(updatedUsr)
 	if err != nil {
 		return err
 	}
 
+	err = repo.Update("__users", string(updatedUsr.Email), string(j))
+	if err != nil {
+		return err
+	}
+
+	// if email address was changed, delete the old record of former
+	// user with original email address
+	if usr.Email != updatedUsr.Email {
+		err = repo.Delete("__users", usr.Email)
+		if err != nil {
+			return err
+		}
+	}
+
 	return nil
+
 }
 
 // DeleteUser deletes a user from the db by email
 func DeleteUser(email string) error {
-	err := store.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__users"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
-
-		err := b.Delete([]byte(email))
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+	err := repo.Delete("__users", email)
 	if err != nil {
 		return err
 	}
@@ -136,52 +100,23 @@ func DeleteUser(email string) error {
 
 // User gets the user by email from the db
 func User(email string) ([]byte, error) {
-	val := &bytes.Buffer{}
-	err := store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__users"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
 
-		usr := b.Get([]byte(email))
-
-		_, err := val.Write(usr)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+	val, err := repo.Get("__users", email)
 	if err != nil {
 		return nil, err
 	}
 
-	if val.Bytes() == nil {
+	if val == "" {
 		return nil, ErrNoUserExists
 	}
 
-	return val.Bytes(), nil
+	return []byte(val), nil
 }
 
 // UserAll returns all users from the db
 func UserAll() ([][]byte, error) {
-	var users [][]byte
-	err := store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__users"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
 
-		err := b.ForEach(func(k, v []byte) error {
-			users = append(users, v)
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+	users, err := repo.GetAll("__users")
 	if err != nil {
 		return nil, err
 	}
@@ -220,19 +155,7 @@ func SetRecoveryKey(email string) (string, error) {
 	r := rand.New(rand.NewSource(time.Now().Unix()))
 	key := fmt.Sprintf("%d", r.Int63())
 
-	err := store.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists([]byte("__recoveryKeys"))
-		if err != nil {
-			return err
-		}
-
-		err = b.Put([]byte(email), []byte(key))
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+	err := repo.Update("__recoveryKeys", email, key)
 	if err != nil {
 		return "", err
 	}
@@ -243,24 +166,11 @@ func SetRecoveryKey(email string) (string, error) {
 // RecoveryKey gets a previously set recovery key to verify an email address
 // submitted in order to recover/reset an account password
 func RecoveryKey(email string) (string, error) {
-	key := &bytes.Buffer{}
 
-	err := store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__recoveryKeys"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
-
-		_, err := key.Write(b.Get([]byte(email)))
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+	key, err := repo.Get("__recoveryKeys", email)
 	if err != nil {
 		return "", err
 	}
 
-	return key.String(), nil
+	return key, nil
 }

@@ -11,9 +11,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ponzu-cms/ponzu/system/db/repo"
+
 	"github.com/ponzu-cms/ponzu/system/item"
 
-	"github.com/boltdb/bolt"
 	"github.com/gorilla/schema"
 	uuid "github.com/satori/go.uuid"
 )
@@ -57,68 +58,50 @@ func SetUpload(target string, data url.Values) (int, error) {
 	// store in database
 	var id uint64
 	var err error
-	err = store.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists([]byte("__uploads"))
+	if pid == "-1" {
+		// get sequential ID for item
+		id, err = repo.NextSequence("__uploads")
 		if err != nil {
-			return err
+			return 0, err
 		}
-
-		if pid == "-1" {
-			// get sequential ID for item
-			id, err = b.NextSequence()
-			if err != nil {
-				return err
-			}
-			data.Set("id", fmt.Sprintf("%d", id))
-		} else {
-			uid, err := strconv.ParseInt(pid, 10, 64)
-			if err != nil {
-				return err
-			}
-			id = uint64(uid)
-			data.Set("id", fmt.Sprintf("%d", id))
-		}
-
-		file := &item.FileUpload{}
-		dec := schema.NewDecoder()
-		dec.SetAliasTag("json")     // allows simpler struct tagging when creating a content type
-		dec.IgnoreUnknownKeys(true) // will skip over form values submitted, but not in struct
-		err = dec.Decode(file, data)
+		data.Set("id", fmt.Sprintf("%d", id))
+	} else {
+		uid, err := strconv.ParseInt(pid, 10, 64)
 		if err != nil {
-			return err
+			return 0, err
 		}
+		id = uint64(uid)
+		data.Set("id", fmt.Sprintf("%d", id))
+	}
+	file := &item.FileUpload{}
+	dec := schema.NewDecoder()
+	dec.SetAliasTag("json")     // allows simpler struct tagging when creating a content type
+	dec.IgnoreUnknownKeys(true) // will skip over form values submitted, but not in struct
+	err = dec.Decode(file, data)
+	if err != nil {
+		return 0, err
+	}
+	// marshal data to json for storage
+	j, err := json.Marshal(file)
+	if err != nil {
+		return 0, err
+	}
+	uploadKey, err := key(data.Get("id"))
+	if err != nil {
+		return 0, err
+	}
+	repo.Update("__uploads", string(uploadKey), string(j))
+	if err != nil {
+		return 0, err
+	}
+	// add slug to __contentIndex for lookup
+	k := []byte(data.Get("slug"))
+	v := []byte(fmt.Sprintf("__uploads:%d", id))
+	err = repo.Update("__contentIndex", string(k), string(v))
+	if err != nil {
+		return 0, err
+	}
 
-		// marshal data to json for storage
-		j, err := json.Marshal(file)
-		if err != nil {
-			return err
-		}
-
-		uploadKey, err := key(data.Get("id"))
-		if err != nil {
-			return err
-		}
-		err = b.Put(uploadKey, j)
-		if err != nil {
-			return err
-		}
-
-		// add slug to __contentIndex for lookup
-		b, err = tx.CreateBucketIfNotExists([]byte("__contentIndex"))
-		if err != nil {
-			return err
-		}
-
-		k := []byte(data.Get("slug"))
-		v := []byte(fmt.Sprintf("__uploads:%d", id))
-
-		err = b.Put(k, v)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
 	if err != nil {
 		return 0, err
 	}
@@ -139,16 +122,14 @@ func Upload(target string) ([]byte, error) {
 		return nil, err
 	}
 
-	err = store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__uploads"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
-
-		j := b.Get(id)
-		_, err := val.Write(j)
-		return err
-	})
+	j, err := repo.Get("__uploads", string(id))
+	if err != nil {
+		return val.Bytes(), err
+	}
+	_, err = val.Write([]byte(j))
+	if err != nil {
+		return val.Bytes(), err
+	}
 
 	return val.Bytes(), err
 }
@@ -157,50 +138,28 @@ func Upload(target string) ([]byte, error) {
 func UploadBySlug(slug string) ([]byte, error) {
 	val := &bytes.Buffer{}
 	// get target from __contentIndex or return nil if not exists
-	err := store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__contentIndex"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
+	value, err := repo.Get("__contentIndex", slug)
+	v := []byte(value)
+	if v == nil {
+		return nil, fmt.Errorf("no value for key '%s' in __contentIndex", slug)
+	}
 
-		v := b.Get([]byte(slug))
-		if v == nil {
-			return fmt.Errorf("no value for key '%s' in __contentIndex", slug)
-		}
+	j, err := Upload(string(v))
+	if err != nil {
+		return nil, fmt.Errorf("Error uploading in __contentIndex")
+	}
 
-		j, err := Upload(string(v))
-		if err != nil {
-			return err
-		}
-
-		_, err = val.Write(j)
-
-		return err
-	})
+	_, err = val.Write(j)
 
 	return val.Bytes(), err
 }
 
 // UploadAll returns a [][]byte containing all upload data from the system
 func UploadAll() [][]byte {
-	var uploads [][]byte
-	err := store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__uploads"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
 
-		numKeys := b.Stats().KeyN
-		uploads = make([][]byte, 0, numKeys)
-
-		return b.ForEach(func(k, v []byte) error {
-			uploads = append(uploads, v)
-			return nil
-		})
-	})
+	uploads, err := repo.GetAll("__uploads")
 	if err != nil {
-		log.Println("Error in UploadAll:", err)
-		return nil
+		log.Printf("Error getting all Uploads")
 	}
 
 	return uploads
@@ -218,14 +177,7 @@ func DeleteUpload(target string) error {
 		return err
 	}
 
-	return store.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(parts[0]))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
-
-		return b.Delete(id)
-	})
+	return repo.Delete(parts[0], string(id))
 }
 
 func key(sid string) ([]byte, error) {

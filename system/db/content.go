@@ -12,10 +12,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ponzu-cms/ponzu/system/db/repo"
+
 	"github.com/ponzu-cms/ponzu/system/item"
 	"github.com/ponzu-cms/ponzu/system/search"
 
-	"github.com/boltdb/bolt"
 	"github.com/gorilla/schema"
 	uuid "github.com/satori/go.uuid"
 )
@@ -97,19 +98,7 @@ func update(ns, id string, data url.Values, existingContent *[]byte) (int, error
 		}
 	}
 
-	err = store.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists([]byte(ns + specifier))
-		if err != nil {
-			return err
-		}
-
-		err = b.Put([]byte(fmt.Sprintf("%d", cid)), j)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+	err = repo.Update(ns+specifier, string(cid), string(j))
 	if err != nil {
 		return 0, nil
 	}
@@ -183,65 +172,47 @@ func insert(ns string, data url.Values) (int, error) {
 
 	var j []byte
 	var cid string
-	err := store.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists([]byte(ns + specifier))
+
+	// get the next available ID and convert to string
+	// also set effectedID to int of ID
+	id, err := repo.NextSequence(ns + specifier)
+	if err != nil {
+		return 0, err
+	}
+	cid = strconv.FormatUint(id, 10)
+	effectedID, err = strconv.Atoi(cid)
+	if err != nil {
+		return 0, err
+	}
+	data.Set("id", cid)
+	// add UUID to data for use in embedded Item
+	uid, err := uuid.NewV4()
+	if err != nil {
+		return 0, err
+	}
+	data.Set("uuid", uid.String())
+	// if type has a specifier, add it to data for downstream processing
+	if specifier != "" {
+		data.Set("__specifier", specifier)
+	}
+	j, err = postToJSON(ns, data)
+	if err != nil {
+		return 0, err
+	}
+	err = repo.Update(ns+specifier, cid, string(j))
+	if err != nil {
+		return 0, err
+	}
+	// store the slug,type:id in contentIndex if public content
+	if specifier == "" {
+		k := []byte(data.Get("slug"))
+		v := []byte(fmt.Sprintf("%s:%d", ns, effectedID))
+		err := repo.Update("__contentIndex", string(k), string(v))
 		if err != nil {
-			return err
+			return 0, err
 		}
+	}
 
-		// get the next available ID and convert to string
-		// also set effectedID to int of ID
-		id, err := b.NextSequence()
-		if err != nil {
-			return err
-		}
-		cid = strconv.FormatUint(id, 10)
-		effectedID, err = strconv.Atoi(cid)
-		if err != nil {
-			return err
-		}
-		data.Set("id", cid)
-
-		// add UUID to data for use in embedded Item
-		uid, err := uuid.NewV4()
-		if err != nil {
-			return err
-		}
-
-		data.Set("uuid", uid.String())
-
-		// if type has a specifier, add it to data for downstream processing
-		if specifier != "" {
-			data.Set("__specifier", specifier)
-		}
-
-		j, err = postToJSON(ns, data)
-		if err != nil {
-			return err
-		}
-
-		err = b.Put([]byte(cid), j)
-		if err != nil {
-			return err
-		}
-
-		// store the slug,type:id in contentIndex if public content
-		if specifier == "" {
-			ci := tx.Bucket([]byte("__contentIndex"))
-			if ci == nil {
-				return bolt.ErrBucketNotFound
-			}
-
-			k := []byte(data.Get("slug"))
-			v := []byte(fmt.Sprintf("%s:%d", ns, effectedID))
-			err := ci.Put(k, v)
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
 	if err != nil {
 		return 0, err
 	}
@@ -288,34 +259,16 @@ func DeleteContent(target string) error {
 		return err
 	}
 
-	err = store.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(ns))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
-
-		err := b.Delete([]byte(id))
+	err = repo.Delete(ns, id)
+	if err != nil {
+		return err
+	}
+	// if content has a slug, also delete it from __contentIndex
+	if itm.Slug != "" {
+		err := repo.Delete("__contentIndex", itm.Slug)
 		if err != nil {
 			return err
 		}
-
-		// if content has a slug, also delete it from __contentIndex
-		if itm.Slug != "" {
-			ci := tx.Bucket([]byte("__contentIndex"))
-			if ci == nil {
-				return bolt.ErrBucketNotFound
-			}
-
-			err := ci.Delete([]byte(itm.Slug))
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-	if err != nil {
-		return err
 	}
 
 	// delete changes data, so invalidate client caching
@@ -351,20 +304,13 @@ func Content(target string) ([]byte, error) {
 	ns, id := t[0], t[1]
 
 	val := &bytes.Buffer{}
-	err := store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(ns))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
+	value, err := repo.Get(ns, id)
+	if err != nil {
+		return nil, err
+	}
 
-		_, err := val.Write(b.Get([]byte(id)))
-		if err != nil {
-			log.Println(err)
-			return err
-		}
+	_, err = val.Write([]byte(value))
 
-		return nil
-	})
 	if err != nil {
 		return nil, err
 	}
@@ -395,34 +341,17 @@ func ContentMulti(targets []string) ([][]byte, error) {
 func ContentBySlug(slug string) (string, []byte, error) {
 	val := &bytes.Buffer{}
 	var t, id string
-	err := store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__contentIndex"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
+	value, err := repo.Get("__contentIndex", slug)
+	idx := []byte(value)
+	if idx != nil {
+		tid := strings.Split(string(idx), ":")
+		if len(tid) < 2 {
+			log.Println("Bad data in content index for slug")
 		}
-		idx := b.Get([]byte(slug))
-
-		if idx != nil {
-			tid := strings.Split(string(idx), ":")
-
-			if len(tid) < 2 {
-				return fmt.Errorf("Bad data in content index for slug: %s", slug)
-			}
-
-			t, id = tid[0], tid[1]
-		}
-
-		c := tx.Bucket([]byte(t))
-		if c == nil {
-			return bolt.ErrBucketNotFound
-		}
-		_, err := val.Write(c.Get([]byte(id)))
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+		t, id = tid[0], tid[1]
+	}
+	idv, err := repo.Get("__contentIndex", id)
+	_, err = val.Write([]byte(idv))
 	if err != nil {
 		return t, nil, err
 	}
@@ -432,29 +361,15 @@ func ContentBySlug(slug string) (string, []byte, error) {
 
 // ContentAll retrives all items from the database within the provided namespace
 func ContentAll(namespace string) [][]byte {
-	var posts [][]byte
-	store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(namespace))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
 
-		numKeys := b.Stats().KeyN
-		posts = make([][]byte, 0, numKeys)
+	posts, err := repo.GetAll(namespace)
 
-		b.ForEach(func(k, v []byte) error {
-			posts = append(posts, v)
-
-			return nil
-		})
-
-		return nil
-	})
-
+	if err != nil {
+		log.Println("Error getting posts: ", err)
+	}
 	return posts
 }
 
-// QueryOptions holds options for a query
 type QueryOptions struct {
 	Count  int
 	Offset int
@@ -467,105 +382,7 @@ func Query(namespace string, opts QueryOptions) (int, [][]byte) {
 	var posts [][]byte
 	var total int
 
-	// correct bad input rather than return nil or error
-	// similar to default case for opts.Order switch below
-	if opts.Count < 0 {
-		opts.Count = -1
-	}
-
-	if opts.Offset < 0 {
-		opts.Offset = 0
-	}
-
-	store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte(namespace))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
-
-		c := b.Cursor()
-		n := b.Stats().KeyN
-		total = n
-
-		// return nil if no content
-		if n == 0 {
-			return nil
-		}
-
-		var start, end int
-		switch opts.Count {
-		case -1:
-			start = 0
-			end = n
-
-		default:
-			start = opts.Count * opts.Offset
-			end = start + opts.Count
-		}
-
-		// bounds check on posts given the start & end count
-		if start > n {
-			start = n - opts.Count
-		}
-		if end > n {
-			end = n
-		}
-
-		i := 0   // count of num posts added
-		cur := 0 // count of num cursor moves
-		switch opts.Order {
-		case "desc", "":
-			for k, v := c.Last(); k != nil; k, v = c.Prev() {
-				if cur < start {
-					cur++
-					continue
-				}
-
-				if cur >= end {
-					break
-				}
-
-				posts = append(posts, v)
-				i++
-				cur++
-			}
-
-		case "asc":
-			for k, v := c.First(); k != nil; k, v = c.Next() {
-				if cur < start {
-					cur++
-					continue
-				}
-
-				if cur >= end {
-					break
-				}
-
-				posts = append(posts, v)
-				i++
-				cur++
-			}
-
-		default:
-			// results for DESC order
-			for k, v := c.Last(); k != nil; k, v = c.Prev() {
-				if cur < start {
-					cur++
-					continue
-				}
-
-				if cur >= end {
-					break
-				}
-
-				posts = append(posts, v)
-				i++
-				cur++
-			}
-		}
-
-		return nil
-	})
+	total, posts = repo.Query(namespace, repo.QueryOptions(opts))
 
 	return total, posts
 }
@@ -640,7 +457,6 @@ func SortContent(namespace string) {
 
 		err := json.Unmarshal(j, &post)
 		if err != nil {
-			log.Println("Error decoding json while sorting", namespace, ":", err)
 			return
 		}
 
@@ -664,31 +480,13 @@ func SortContent(namespace string) {
 	}
 
 	// store in <namespace>_sorted bucket, first delete existing
-	err := store.Update(func(tx *bolt.Tx) error {
-		bname := []byte(namespace + "__sorted")
-		err := tx.DeleteBucket(bname)
-		if err != nil && err != bolt.ErrBucketNotFound {
-			return err
-		}
-
-		b, err := tx.CreateBucketIfNotExists(bname)
+	// encode to json and store as 'post.Time():i':post
+	for i := range bb {
+		cid := fmt.Sprintf("%d:%d", posts[i].Time(), i)
+		err := repo.Update(namespace+"__sorted", cid, string(bb[i]))
 		if err != nil {
-			return err
+			log.Println("Error while updating db with sorted")
 		}
-
-		// encode to json and store as 'post.Time():i':post
-		for i := range bb {
-			cid := fmt.Sprintf("%d:%d", posts[i].Time(), i)
-			err = b.Put([]byte(cid), bb[i])
-			if err != nil {
-				return err
-			}
-		}
-
-		return nil
-	})
-	if err != nil {
-		log.Println("Error while updating db with sorted", namespace, err)
 	}
 
 }
@@ -798,29 +596,22 @@ func postToJSON(ns string, data url.Values) ([]byte, error) {
 
 func checkSlugForDuplicate(slug string) (string, error) {
 	// check for existing slug in __contentIndex
-	err := store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__contentIndex"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
-		original := slug
-		exists := true
-		i := 0
-		for exists {
-			s := b.Get([]byte(slug))
-			if s == nil {
-				exists = false
-				return nil
-			}
 
-			i++
-			slug = fmt.Sprintf("%s-%d", original, i)
+	original := slug
+	exists := true
+	i := 0
+	for exists {
+		s, err := repo.Get("__contentIndex", slug)
+		if err != nil {
+			return "", err
 		}
-
-		return nil
-	})
-	if err != nil {
-		return "", err
+		//Check if we must control string empty or error value
+		if s == "" {
+			exists = false
+			return "", nil
+		}
+		i++
+		slug = fmt.Sprintf("%s-%d", original, i)
 	}
 
 	return slug, nil

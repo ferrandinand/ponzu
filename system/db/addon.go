@@ -1,15 +1,14 @@
 package db
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/url"
 
-	"github.com/boltdb/bolt"
 	"github.com/gorilla/schema"
+	"github.com/ponzu-cms/ponzu/system/db/repo"
 )
 
 var (
@@ -20,32 +19,14 @@ var (
 // Addon looks for an addon by its addon_reverse_dns as the key and returns
 // the []byte as json representation of an addon
 func Addon(key string) ([]byte, error) {
-	buf := &bytes.Buffer{}
 
-	err := store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__addons"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
+	val, err := repo.Get("__addons", key)
 
-		val := b.Get([]byte(key))
-
-		if val == nil {
-			return ErrNoAddonExists
-		}
-
-		_, err := buf.Write(val)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
 	if err != nil {
 		return nil, err
 	}
 
-	return buf.Bytes(), nil
+	return []byte(val), nil
 }
 
 // SetAddon stores the values of an addon into the __addons bucket with a the
@@ -65,19 +46,8 @@ func SetAddon(data url.Values, kind interface{}) error {
 		return fmt.Errorf(`Addon "%s" has no identifier to use as key.`, name)
 	}
 
-	err = store.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__addons"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
+	err = repo.Update("__addons", k, string(v))
 
-		err := b.Put([]byte(k), v)
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
 	if err != nil {
 		return err
 	}
@@ -87,25 +57,8 @@ func SetAddon(data url.Values, kind interface{}) error {
 
 // AddonAll returns all registered addons as a [][]byte
 func AddonAll() [][]byte {
-	var all [][]byte
 
-	err := store.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__addons"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
-
-		err := b.ForEach(func(k, v []byte) error {
-			all = append(all, v)
-
-			return nil
-		})
-		if err != nil {
-			return err
-		}
-
-		return nil
-	})
+	all, err := repo.GetAll("__addons")
 	if err != nil {
 		log.Println("Error finding addons in db with db.AddonAll:", err)
 		return nil
@@ -116,18 +69,9 @@ func AddonAll() [][]byte {
 
 // DeleteAddon removes an addon from the db by its key, the addon_reverse_dns
 func DeleteAddon(key string) error {
-	err := store.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket([]byte("__addons"))
-		if b == nil {
-			return bolt.ErrBucketNotFound
-		}
 
-		if err := b.Delete([]byte(key)); err != nil {
-			return err
-		}
+	err := repo.Delete("__addons", key)
 
-		return nil
-	})
 	if err != nil {
 		return err
 	}
@@ -140,26 +84,16 @@ func DeleteAddon(key string) error {
 func AddonExists(key string) bool {
 	var exists bool
 
-	if store == nil {
-		Init()
-	}
-
-	err := store.Update(func(tx *bolt.Tx) error {
-		b, err := tx.CreateBucketIfNotExists([]byte("__addons"))
-		if err != nil {
-			return err
-		}
-		if b.Get([]byte(key)) == nil {
-			return nil
-		}
-
-		exists = true
-		return nil
-	})
+	v, err := repo.Get("__addons", key)
 	if err != nil {
 		log.Println("Error checking existence of addon with key:", key, "-", err)
 		return false
 	}
 
+	if v != "" {
+		exists = true
+	}
+
 	return exists
+
 }

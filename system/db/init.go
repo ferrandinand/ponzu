@@ -6,6 +6,8 @@ import (
 	"github.com/nilslice/jwt"
 	"github.com/ponzu-cms/ponzu/system/item"
 	"github.com/ponzu-cms/ponzu/system/search"
+
+	"github.com/ponzu-cms/ponzu/system/db/repo"
 )
 
 var (
@@ -15,14 +17,13 @@ var (
 		"__contentIndex",
 	}
 
-	bucketsToAdd 
-	[]string
+	bucketsToAdd []string
 )
 
 // Close exports the abillity to close our db file. Should be called with defer
 // after call to Init() from the same place.
 func Close() {
-	err := store.Close()
+	err := repo.Close()
 	if err != nil {
 		log.Println(err)
 	}
@@ -40,8 +41,8 @@ func Init() {
 		log.Fatalln(err)
 	}
 
-	store.setRepository(repository)
-	store.InitSchema(buckets)
+	repo.SetRepository(store)
+	repo.InitSchema(buckets)
 
 	err = LoadCacheConfig()
 	if err != nil {
@@ -87,7 +88,7 @@ func InitSearchIndex() {
 func SystemInitComplete() bool {
 	complete := true
 
-	_, err := store.GetAll("__users")
+	_, err := repo.GetAll("__users")
 
 	if err != nil {
 		complete = false
